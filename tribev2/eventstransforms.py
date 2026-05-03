@@ -107,10 +107,13 @@ class ExtractWordsFromAudio(EventsTransform):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16"
 
+        import sys
+
         with tempfile.TemporaryDirectory() as output_dir:
-            logger.info("Running whisperx via uvx...")
+            logger.info("Running whisperx...")
             cmd = [
-                "uvx",
+                sys.executable,
+                "-m",
                 "whisperx",
                 str(wav_filename),
                 "--model",

@@ -25,7 +25,7 @@ for path in [CACHEDIR, SAVEDIR, DATADIR]:
 text_feature = {
     "name": "HuggingFaceText",
     "event_types": "Word",
-    "model_name": "meta-llama/Llama-3.2-3B",
+    "model_name": "unsloth/Llama-3.2-3B",
     "aggregation": "sum",
     "frequency": 2,
     "contextualized": True,

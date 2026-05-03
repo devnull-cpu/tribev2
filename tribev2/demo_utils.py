@@ -7,6 +7,7 @@
 """TribeModel for inference and utilities for building event DataFrames."""
 
 import logging
+import re
 import typing as tp
 from pathlib import Path
 
@@ -93,6 +94,80 @@ def get_audio_and_text_events(
     for transform in transforms:
         events = transform(events)
     return standardize_events(events)
+
+
+def _cuda_runtime_supported() -> bool:
+    """Return True only when the installed torch build can run this GPU."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        supported_majors = {
+            int(arch.removeprefix("sm_")[0])
+            for arch in torch.cuda.get_arch_list()
+            if arch.startswith("sm_")
+        }
+        return major in supported_majors
+    except Exception:
+        return False
+
+
+def build_text_events_from_text(
+    text: str,
+    *,
+    seconds_per_word: float = 0.45,
+    max_context_words: int = 128,
+    timeline: str = "default",
+    subject: str = "default",
+    language: str | None = None,
+) -> pd.DataFrame:
+    """Create Word events directly from raw text without TTS or ASR."""
+    normalized = text.replace("\r\n", "\n").strip()
+    if not normalized:
+        raise ValueError("Text input is empty.")
+    if seconds_per_word <= 0:
+        raise ValueError("seconds_per_word must be strictly positive.")
+    if max_context_words < 1:
+        raise ValueError("max_context_words must be at least 1.")
+
+    sentence_splitter = re.compile(r"(?<=[.!?])(?:\s+|\n+)|\n+")
+    word_pattern = re.compile(r"[^\W_]+(?:[''-][^\W_]+)*", flags=re.UNICODE)
+    sentences = [
+        sentence.strip()
+        for sentence in sentence_splitter.split(normalized)
+        if sentence.strip()
+    ]
+    if not sentences:
+        sentences = [normalized]
+
+    rows: list[dict[str, tp.Any]] = []
+    context_words: list[str] = []
+    current_start = 0.0
+    for sequence_id, sentence in enumerate(sentences):
+        words = word_pattern.findall(sentence)
+        if not words:
+            continue
+        for word in words:
+            context_words.append(word)
+            row = {
+                "type": "Word",
+                "text": word,
+                "start": current_start,
+                "duration": seconds_per_word,
+                "sequence_id": sequence_id,
+                "sentence": sentence,
+                "context": " ".join(context_words[-max_context_words:]),
+                "timeline": timeline,
+                "subject": subject,
+            }
+            if language is not None:
+                row["language"] = language
+            rows.append(row)
+            current_start += seconds_per_word
+
+    if not rows:
+        raise ValueError("No valid words were found in the provided text.")
+    return standardize_events(pd.DataFrame(rows))
 
 
 class TextToEvents(pydantic.BaseModel):
@@ -191,18 +266,27 @@ class TribeModel(TribeExperiment):
             Path(cache_folder).mkdir(parents=True, exist_ok=True)
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        checkpoint_dir = Path(checkpoint_dir)
-        if checkpoint_dir.exists():
-            config_path = checkpoint_dir / "config.yaml"
-            ckpt_path = checkpoint_dir / checkpoint_name
+        checkpoint_path = Path(checkpoint_dir)
+        if checkpoint_path.exists():
+            config_path = checkpoint_path / "config.yaml"
+            ckpt_path = checkpoint_path / checkpoint_name
         else:
             from huggingface_hub import hf_hub_download
 
-            repo_id = str(checkpoint_dir)
+            repo_id = str(checkpoint_dir).replace("\\", "/")
             config_path = hf_hub_download(repo_id, "config.yaml")
             ckpt_path = hf_hub_download(repo_id, checkpoint_name)
-        with open(config_path, "r") as f:
-            config = ConfDict(yaml.load(f, Loader=yaml.UnsafeLoader))
+        import platform
+        if platform.system() == "Windows":
+            import pathlib
+            _orig = pathlib.PosixPath
+            pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc]
+        try:
+            with open(config_path, "r") as f:
+                config = ConfDict(yaml.load(f, Loader=yaml.UnsafeLoader))
+        finally:
+            if platform.system() == "Windows":
+                pathlib.PosixPath = _orig  # type: ignore[misc]
         for modality in ["text", "audio", "video"]:
             config[f"data.{modality}_feature.infra.folder"] = cache_folder
             config[f"data.{modality}_feature.infra.cluster"] = cluster
@@ -354,7 +438,11 @@ class TribeModel(TribeExperiment):
                 "TribeModel must be instantiated via the .from_pretrained method"
             )
         model = self._model
+        device = next(model.parameters()).device
+        model.cpu()
+        torch.cuda.empty_cache()
         loader = self.data.get_loaders(events=events, split_to_build="all")["all"]
+        model.to(device)
 
         preds, all_segments = [], []
         n_samples, n_kept = 0, 0
