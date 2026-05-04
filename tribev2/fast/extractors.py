@@ -82,7 +82,8 @@ def _autocast_dtype(device: torch.device, requested: torch.dtype) -> torch.dtype
     return requested
 
 
-ENABLE_COMPILE = True
+import os as _os
+ENABLE_COMPILE = _os.name != "nt"
 
 
 def _quantization_kwargs(config: ExtractorConfig) -> dict:

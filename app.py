@@ -1,5 +1,6 @@
 """TRIBE v2 Explorer — Gradio dashboard for brain activity prediction."""
 
+import base64
 import logging
 import os
 import subprocess
@@ -34,9 +35,12 @@ if os.name == "nt":
 from tribev2.demo_utils import TribeModel, get_audio_and_text_events, build_text_events_from_text
 from tribev2.plotting import PlotBrainNilearn
 from tribev2.utils import get_hcp_labels, summarize_by_roi
+from tribev2.viewer import build_viewer_html
 
 CACHE = Path("./cache")
 CACHE.mkdir(exist_ok=True)
+RUNS_DIR = CACHE / "runs"
+RUNS_DIR.mkdir(exist_ok=True)
 
 ZONE_GROUPS = {
     "Visual": ["V1", "V2", "V3", "V4", "V6", "V7", "V8", "MT", "MST", "LO", "FFC", "VVC", "VMV", "PIT"],
@@ -147,6 +151,58 @@ def plot_zone_timeseries(df):
     fig.tight_layout()
     return fig
 
+# ── Run persistence ────────────────────────────────────────────────────
+
+import hashlib
+from datetime import datetime
+
+def save_run(preds, time_axis, zone_df, input_kind, source_name, video_path=None):
+    """Save a run to disk for instant reload."""
+    run_id = hashlib.md5(f"{source_name}_{preds.shape}_{datetime.now().isoformat()}".encode()).hexdigest()[:10]
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(exist_ok=True)
+    np.save(run_dir / "preds.npy", preds)
+    np.save(run_dir / "time_axis.npy", np.array(time_axis))
+    zone_df.to_csv(run_dir / "zones.csv", index=True)
+    meta = {
+        "id": run_id,
+        "input_kind": input_kind,
+        "source_name": source_name,
+        "n_timesteps": int(preds.shape[0]),
+        "n_vertices": int(preds.shape[1]),
+        "duration_s": round(float(time_axis[-1] - time_axis[0]), 1) if len(time_axis) > 1 else 0,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "video_path": str(video_path) if video_path else None,
+    }
+    import json
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return run_id
+
+
+def list_runs():
+    """List all saved runs, newest first."""
+    import json
+    runs = []
+    for meta_path in RUNS_DIR.glob("*/meta.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            runs.append(meta)
+        except Exception:
+            pass
+    runs.sort(key=lambda r: r.get("created", ""), reverse=True)
+    return runs
+
+
+def load_run(run_id):
+    """Load a saved run."""
+    run_dir = RUNS_DIR / run_id
+    preds = np.load(run_dir / "preds.npy")
+    time_axis = np.load(run_dir / "time_axis.npy").tolist()
+    zone_df = pd.read_csv(run_dir / "zones.csv", index_col=0)
+    import json
+    meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    return preds, time_axis, zone_df, meta
+
 # ── Event preparation ─────────────────────────────────────────────────
 
 def prepare_video_events(video_path, chunk=True):
@@ -243,7 +299,7 @@ def run_prediction(video, audio, text, pipeline_backend, decoder_backend, progre
         log.info("Running FastTribePipeline.predict()...")
         fast = FastTribePipeline.from_pretrained(
             "facebook/tribev2",
-            cache_folder=str(CACHE),
+            cache_dir=str(CACHE),
             text_model="unsloth/Llama-3.2-3B",
         )
         preds, segments = fast.predict(events=df)
@@ -268,7 +324,19 @@ def run_prediction(video, audio, text, pipeline_backend, decoder_backend, progre
     zone_df = build_zone_timeseries(preds, time_axis=time_axis)
     ts_fig = plot_zone_timeseries(zone_df)
 
-    progress(0.8, desc="Rendering brain panels...")
+    progress(0.8, desc="Building 3D brain viewer...")
+    log.info("Building 3D brain viewer...")
+    t0 = _time.time()
+    zone_dict = {col: zone_df[col].tolist() for col in zone_df.columns}
+    viewer_html_content = build_viewer_html(
+        preds, time_axis=time_axis, zone_data=zone_dict,
+        height=500,
+    )
+    import html as _html
+    viewer_html = '<iframe srcdoc="' + _html.escape(viewer_html_content) + '" width="100%" height="750" frameborder="0" sandbox="allow-scripts"></iframe>'
+    log.info("3D viewer built (%.1fs)", _time.time() - t0)
+
+    progress(0.9, desc="Rendering brain panels...")
     log.info("Rendering brain overview...")
     t0 = _time.time()
     n = preds.shape[0]
@@ -277,9 +345,9 @@ def run_prediction(video, audio, text, pipeline_backend, decoder_backend, progre
     brain_fig = render_brain_row(preds, sample_indices, plotter, time_axis=time_axis)
     log.info("Brain overview done (%.1fs)", _time.time() - t0)
 
-    progress(0.95, desc="Rendering selected timestep...")
-    mid = n // 2
-    detail_fig = render_brain(preds[mid], plotter)
+    source_name = Path(video or audio or "text").name if (video or audio) else "text_input"
+    run_id = save_run(preds, time_axis, zone_df, input_kind, source_name, video_path=video)
+    log.info("Run saved: %s", run_id)
 
     log.info("All done!")
     progress(1.0, desc="Done!")
@@ -292,9 +360,59 @@ def run_prediction(video, audio, text, pipeline_backend, decoder_backend, progre
         summary,
         ts_fig,
         brain_fig,
-        detail_fig,
-        gr.Slider(minimum=0, maximum=n - 1, value=mid, step=1, label="Timestep", interactive=True),
+        viewer_html,
         preds,
+        _format_runs_list(),
+    )
+
+
+def _format_runs_list():
+    runs = list_runs()
+    if not runs:
+        return "No saved runs yet."
+    lines = []
+    for r in runs:
+        lines.append(f"- **{r['source_name']}** ({r['input_kind']}) — {r['n_timesteps']} steps, {r['duration_s']}s — `{r['id']}` — {r['created']}")
+    return "\n".join(lines)
+
+
+def load_previous_run(run_id_text):
+    if not run_id_text or not run_id_text.strip():
+        raise gr.Error("Enter a run ID")
+    run_id = run_id_text.strip().split("`")[-2] if "`" in run_id_text else run_id_text.strip()
+    try:
+        preds, time_axis, zone_df, meta = load_run(run_id)
+    except Exception as e:
+        raise gr.Error(f"Failed to load run: {e}")
+
+    ts_fig = plot_zone_timeseries(zone_df)
+
+    zone_dict = {col: zone_df[col].tolist() for col in zone_df.columns}
+    video_path = meta.get("video_path")
+    viewer_html_content = build_viewer_html(
+        preds, time_axis=time_axis, zone_data=zone_dict,
+        video_path=video_path, height=500,
+    )
+    import html as _html
+    viewer_html = '<iframe srcdoc="' + _html.escape(viewer_html_content) + '" width="100%" height="750" frameborder="0" sandbox="allow-scripts"></iframe>'
+
+    plotter = get_plotter()
+    n = preds.shape[0]
+    step = max(1, n // 8)
+    sample_indices = list(range(0, n, step))[:8]
+    brain_fig = render_brain_row(preds, sample_indices, plotter, time_axis=time_axis)
+
+    duration_s = time_axis[-1] - time_axis[0] if len(time_axis) > 1 else 0
+    hz = n / duration_s if duration_s > 0 else 0
+    summary = f"**{n}** timesteps ({duration_s:.1f}s at {hz:.1f}Hz) × **{preds.shape[1]}** vertices ({meta['input_kind']}) — loaded from `{run_id}`"
+
+    return (
+        summary,
+        ts_fig,
+        brain_fig,
+        viewer_html,
+        preds,
+        _format_runs_list(),
     )
 
 def update_timestep(timestep, preds_state):
@@ -346,33 +464,37 @@ def build_ui():
             with gr.Column(scale=3):
                 gr.Markdown("### Results")
 
+                with gr.Tab("3D Brain"):
+                    brain_3d = gr.HTML(label="Interactive 3D brain viewer")
+
                 with gr.Tab("Timeline"):
                     ts_plot = gr.Plot(label="Region activity over time")
 
                 with gr.Tab("Brain overview"):
                     brain_row_plot = gr.Plot(label="Brain activity across timesteps")
 
-                with gr.Tab("Explore timestep"):
-                    timestep_slider = gr.Slider(
-                        minimum=0, maximum=1, value=0, step=1,
-                        label="Timestep", interactive=True,
-                    )
-                    detail_plot = gr.Plot(label="Brain activity at selected timestep")
+                with gr.Tab("History"):
+                    runs_md = gr.Markdown(_format_runs_list())
+                    load_id = gr.Textbox(label="Run ID", placeholder="Paste run ID to load...")
+                    load_btn = gr.Button("Load run", variant="secondary")
+
+        all_outputs = [summary_md, ts_plot, brain_row_plot, brain_3d, preds_state, runs_md]
 
         run_btn.click(
             fn=run_prediction,
             inputs=[video_in, audio_in, text_in, pipeline_choice, decoder_choice],
-            outputs=[summary_md, ts_plot, brain_row_plot, detail_plot, timestep_slider, preds_state],
+            outputs=all_outputs,
         )
 
-        timestep_slider.change(
-            fn=update_timestep,
-            inputs=[timestep_slider, preds_state],
-            outputs=[detail_plot],
+        load_btn.click(
+            fn=load_previous_run,
+            inputs=[load_id],
+            outputs=all_outputs,
         )
 
     return app
 
 if __name__ == "__main__":
     app = build_ui()
-    app.launch(inbrowser=True)
+    gr.set_static_paths([str(CACHE.resolve())])
+    app.launch(inbrowser=True, allowed_paths=[str(CACHE.resolve())])

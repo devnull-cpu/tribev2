@@ -390,10 +390,15 @@ class FastTribePipeline:
         *,
         verbose: bool = True,
         remove_empty_segments: bool = True,
+        status_callback=None,
     ) -> tuple[np.ndarray, list]:
         """Extract features in parallel, slice into segments, run forward."""
         if self._closed:
             raise RuntimeError("FastTribePipeline has been closed")
+
+        def _status(msg):
+            if status_callback:
+                status_callback(msg)
 
         events = standardize_events(events)
         events = self._add_dummy_categorical_events(events)
@@ -406,14 +411,16 @@ class FastTribePipeline:
 
         extractors = self._build_extractors_on_devices()
         try:
-            self._extract_in_parallel(extractors, fast_events, verbose=verbose)
-        finally:
-            for ext in extractors.values():
+            for name, ext in extractors.items():
+                _status(f"Extracting {name} features...")
+                ext.prepare(fast_events)
                 ext.free()
+        finally:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        _status("Running brain model...")
         self.brain_model.to(brain_device)
 
         # Build segments and dataset.

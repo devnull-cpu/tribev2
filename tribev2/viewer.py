@@ -27,6 +27,28 @@ def _load_mesh(mesh_type="pial"):
     return coords, faces, sulc
 
 
+def _smooth_preds(preds, faces, n_verts, passes=3):
+    """Laplacian smoothing of per-vertex predictions on the mesh."""
+    from scipy import sparse
+    rows, cols = [], []
+    for f in faces:
+        for i in range(3):
+            for j in range(3):
+                if i != j:
+                    rows.append(f[i]); cols.append(f[j])
+    adj = sparse.csr_matrix(
+        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+        shape=(n_verts, n_verts),
+    )
+    degree = np.array(adj.sum(axis=1)).ravel()
+    degree[degree == 0] = 1
+    smooth = preds.copy()
+    for _ in range(passes):
+        neighbor_sum = smooth @ adj.T  # (T, V) @ (V, V)^T
+        smooth = (smooth + neighbor_sum) / (1.0 + degree[np.newaxis, :])
+    return smooth.astype(np.float32)
+
+
 def _pack_binary(coords, faces, sulc, preds):
     n_verts = coords.shape[0]
     n_faces = faces.shape[0]
@@ -61,6 +83,7 @@ def build_viewer_html(
     height : viewer height in pixels
     """
     coords, faces, sulc = _load_mesh(mesh_type)
+    preds = _smooth_preds(preds, faces, coords.shape[0], passes=3)
     blob = _pack_binary(coords, faces, sulc, preds)
     data_b64 = base64.b64encode(blob).decode("ascii")
     n_verts = coords.shape[0]
@@ -105,10 +128,26 @@ _VIEWER_HTML = r"""<!DOCTYPE html>
   canvas { display: block; width: 100%; height: 100%; }
 
   #video-panel { display: none; width: 100%; }
-  #video-panel.visible { display: flex; justify-content: center; padding: 12px 0; }
+  #video-panel.visible { display: flex; justify-content: center; align-items: center; padding: 12px 0; gap: 12px; }
   #video-panel video {
     max-width: 720px; width: 100%; max-height: 360px; object-fit: contain;
     border-radius: 12px; border: 1px solid rgba(255,255,255,0.08);
+  }
+  #vol-control {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+  }
+  #vol-control label { font-size: 11px; color: rgba(255,255,255,0.5); }
+  #vol-control input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 80px; height: 4px;
+    background: rgba(255,255,255,0.15); border-radius: 2px; outline: none;
+  }
+  #vol-control input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%;
+    background: #fff; cursor: pointer;
+  }
+  #vol-control input[type=range]::-moz-range-thumb {
+    width: 12px; height: 12px; border-radius: 50%;
+    background: #fff; cursor: pointer; border: none;
   }
 
   #controls {
@@ -117,18 +156,26 @@ _VIEWER_HTML = r"""<!DOCTYPE html>
 
   /* Styled range slider with orange thumb */
   #controls input[type=range] {
-    flex: 1; height: 4px;
+    flex: 1; height: 6px;
     -webkit-appearance: none; appearance: none;
-    background: rgba(255,255,255,0.1); border-radius: 2px; outline: none;
+    background: rgba(255,255,255,0.15); border-radius: 3px; outline: none;
+    cursor: pointer; margin: 0 4px;
   }
   #controls input[type=range]::-webkit-slider-thumb {
     -webkit-appearance: none; appearance: none;
-    width: 14px; height: 14px; border-radius: 50%;
+    width: 18px; height: 18px; border-radius: 50%;
     background: #ea580c; cursor: pointer; border: 2px solid #fff;
+    margin-top: -6px;
+  }
+  #controls input[type=range]::-webkit-slider-runnable-track {
+    height: 6px; border-radius: 3px;
   }
   #controls input[type=range]::-moz-range-thumb {
-    width: 14px; height: 14px; border-radius: 50%;
+    width: 18px; height: 18px; border-radius: 50%;
     background: #ea580c; cursor: pointer; border: 2px solid #fff;
+  }
+  #controls input[type=range]::-moz-range-track {
+    height: 6px; border-radius: 3px; background: rgba(255,255,255,0.15);
   }
   #controls label {
     font-size: 12px; white-space: nowrap; min-width: 70px;
@@ -192,16 +239,16 @@ _VIEWER_HTML = r"""<!DOCTYPE html>
   <div id="align-debug">
     <b>Brain</b>
     <label>Rot X/Y/Z (deg)</label>
-    <input id="bRX" type="number" value="-111" step="5">
+    <input id="bRX" type="number" value="-110" step="5">
     <input id="bRY" type="number" value="0" step="5">
     <input id="bRZ" type="number" value="180" step="5">
     <hr style="border-color:#333;margin:6px 0">
     <b>Head</b>
-    <label>Scale</label><input id="hScale" type="number" value="101" step="2">
+    <label>Scale</label><input id="hScale" type="number" value="106" step="2">
     <label>Pos X/Y/Z</label>
     <input id="hX" type="number" value="0" step="2">
     <input id="hY" type="number" value="-69" step="2">
-    <input id="hZ" type="number" value="0" step="2">
+    <input id="hZ" type="number" value="-29" step="2">
     <label>Rot X/Y/Z (deg)</label>
     <input id="hRX" type="number" value="0" step="5">
     <input id="hRY" type="number" value="0" step="5">
@@ -223,7 +270,13 @@ _VIEWER_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
-<div id="video-panel"><video id="vidPlayer" muted></video></div>
+<div id="video-panel">
+  <video id="vidPlayer"></video>
+  <div id="vol-control">
+    <label>Vol</label>
+    <input type="range" id="volSlider" min="0" max="1" step="0.05" value="0.5">
+  </div>
+</div>
 <div id="controls">
   <button id="play-btn" title="Play/Pause">&#9654;</button>
   <label id="timeLabel">t=0.0s</label>
@@ -270,53 +323,96 @@ for (let t = 0; t < N_TIMESTEPS; t++) {
   p99s[t] = sorted[Math.floor(sorted.length * 0.99)] || 1;
 }
 
-/* ── Pre-compute sulcal base colors ── */
-const sulcBase = new Float32Array(N_VERTS * 3);
-for (let i = 0; i < N_VERTS; i++) {
-  // Sulcal depth as fake AO: deeper sulci (positive) = darker
-  const s = sulc[i];
-  const ao = 1.0 - Math.max(0, Math.min(1, s * 0.3 + 0.2));
-  const g = (s > 0 ? 0.10 : 0.22) * ao;
-  sulcBase[i * 3] = g;
-  sulcBase[i * 3 + 1] = g;
-  sulcBase[i * 3 + 2] = g;
+/* ── Build per-face color atlas (predictions already smoothed in Python) ── */
+const facesL = [], facesR = [];
+for (let f = 0; f < N_FACES; f++) {
+  const a = faces[f * 3], b = faces[f * 3 + 1], c = faces[f * 3 + 2];
+  if (a < HALF && b < HALF && c < HALF) facesL.push(a, b, c);
+  else facesR.push(a - HALF, b - HALF, c - HALF);
 }
+const nFacesL = facesL.length / 3;
+const nFacesR = facesR.length / 3;
 
-/* ── Split binary data into L/R hemisphere arrays ── */
-function splitHemisphere(fullCoords, fullFaces, startVert, numVerts, totalFaces) {
-  // Extract coords for this hemisphere
-  const hCoords = new Float32Array(numVerts * 3);
-  for (let i = 0; i < numVerts * 3; i++) {
-    hCoords[i] = fullCoords[startVert * 3 + i];
-  }
-  // Extract faces that belong to this hemisphere (vertex indices in [startVert, startVert+numVerts))
-  const tempFaces = [];
-  for (let f = 0; f < totalFaces; f++) {
-    const a = fullFaces[f * 3], b = fullFaces[f * 3 + 1], c = fullFaces[f * 3 + 2];
-    if (a >= startVert && a < startVert + numVerts &&
-        b >= startVert && b < startVert + numVerts &&
-        c >= startVert && c < startVert + numVerts) {
-      tempFaces.push(a - startVert, b - startVert, c - startVert);
+function buildFaceAtlas(hemiFaces, nFaces, vertOffset) {
+  const totalPixels = nFaces * N_TIMESTEPS;
+  const W = Math.min(4096, totalPixels);
+  const H = Math.ceil(totalPixels / W);
+  const data = new Uint8Array(W * H * 4);
+  for (let k = 3; k < data.length; k += 4) data[k] = 255;
+
+  for (let t = 0; t < N_TIMESTEPS; t++) {
+    const tOff = t * N_VERTS + vertOffset;
+    const p99 = p99s[t];
+    const vmin = p99 * 0.5;
+    const invRange = 1.0 / (p99 - vmin + 1e-8);
+    for (let f = 0; f < nFaces; f++) {
+      const a = hemiFaces[f * 3], b = hemiFaces[f * 3 + 1], c = hemiFaces[f * 3 + 2];
+      const val = (preds[tOff + a] + preds[tOff + b] + preds[tOff + c]) / 3.0;
+      const norm = (val - vmin) * invRange;
+      let r = 0, g = 0, bl = 0;
+      if (norm > 0.01) {
+        const n = norm > 1 ? 1 : norm;
+        r = Math.min(1, n * 2.5);
+        g = n > 0.4 ? Math.min(1, (n - 0.4) * 2.5) : 0;
+        bl = n > 0.7 ? Math.min(1, (n - 0.7) * 3.33) : 0;
+      }
+      const px = (t * nFaces + f) * 4;
+      data[px]     = (r * 255 + 0.5) | 0;
+      data[px + 1] = (g * 255 + 0.5) | 0;
+      data[px + 2] = (bl * 255 + 0.5) | 0;
     }
   }
-  const hFaces = new Uint32Array(tempFaces);
-  return { coords: hCoords, faces: hFaces };
+  const tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat);
+  tex.type = THREE.UnsignedByteType;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.flipY = false;
+  tex.needsUpdate = true;
+  return { tex, W, H, numFaces: nFaces };
 }
 
-const hemiL = splitHemisphere(coords, faces, 0, HALF, N_FACES);
-const hemiR = splitHemisphere(coords, faces, HALF, HALF, N_FACES);
+const atlasL = buildFaceAtlas(facesL, nFacesL, 0);
+const atlasR = buildFaceAtlas(facesR, nFacesR, HALF);
 
-/* ── Build three.js BufferGeometry from binary data ── */
-function buildGeometry(hCoords, hFaces) {
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(hCoords, 3));
-  geo.setIndex(new THREE.BufferAttribute(hFaces, 1));
-  // Allocate vertex color buffer
-  const colors = new Float32Array(hCoords.length);
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geo.computeVertexNormals();
-  return geo;
+/* ── Build face adjacency for smooth edge blending ── */
+function buildFaceAdjacency(hemiFaces, nFaces) {
+  const edgeMap = new Map();
+  const adj = new Float32Array(nFaces * 3).fill(-1);
+  for (let f = 0; f < nFaces; f++) {
+    for (let e = 0; e < 3; e++) {
+      const a = hemiFaces[f * 3 + e], b = hemiFaces[f * 3 + (e + 1) % 3];
+      const key = a < b ? a * 100000 + b : b * 100000 + a;
+      if (edgeMap.has(key)) {
+        const [of, oe] = edgeMap.get(key);
+        adj[f * 3 + e] = of;
+        adj[of * 3 + oe] = f;
+      } else {
+        edgeMap.set(key, [f, e]);
+      }
+    }
+  }
+  // Pack into DataTexture: each pixel = (adj0, adj1, adj2, 0)
+  const W = Math.min(4096, nFaces);
+  const H = Math.ceil(nFaces / W);
+  const data = new Float32Array(W * H * 4);
+  for (let f = 0; f < nFaces; f++) {
+    data[f * 4]     = adj[f * 3];
+    data[f * 4 + 1] = adj[f * 3 + 1];
+    data[f * 4 + 2] = adj[f * 3 + 2];
+  }
+  const tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat, THREE.FloatType);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.flipY = false;
+  tex.needsUpdate = true;
+  return { tex, W, H };
 }
+
+const adjTexL = buildFaceAdjacency(facesL, nFacesL);
+const adjTexR = buildFaceAdjacency(facesR, nFacesR);
 
 /* ── Renderer setup ── */
 const container = document.getElementById('brain-container');
@@ -364,71 +460,193 @@ const d5 = new THREE.DirectionalLight(0xffffff, 0.5);
 d5.position.set(-2.017, 0.018, 6.124);
 scene.add(d5);
 
-/* ── Build brain meshes from binary data ── */
-const geoL = buildGeometry(new Float32Array(hemiL.coords), new Uint32Array(hemiL.faces));
-const geoR = buildGeometry(new Float32Array(hemiR.coords), new Uint32Array(hemiR.faces));
+/* ── Load brain GLBs with baked AO vertex colors ── */
+const gltfLoader = new GLTFLoader();
+let meshL, meshR, hemiGroup, brainGroup;
 
-function makeBrainMat() {
+function makeBrainMat(atlas, adjTex) {
+  const faceUniforms = {
+    uFaceTex:   { value: atlas.tex },
+    uAtlasW:    { value: atlas.W },
+    uAtlasH:    { value: atlas.H },
+    uNumFaces:  { value: atlas.numFaces },
+    uFrame0:    { value: 0 },
+    uFrame1:    { value: 0 },
+    uAlpha:     { value: 0 },
+    uAdjTex:    { value: adjTex.tex },
+    uAdjW:      { value: adjTex.W },
+    uAdjH:      { value: adjTex.H },
+  };
   const mat = new THREE.MeshStandardMaterial({
     vertexColors: true,
     roughness: 0.7,
     metalness: 0.02,
     side: THREE.DoubleSide,
   });
-  // Inject per-vertex emissive from the vertex color's brightness
   mat.onBeforeCompile = (shader) => {
-    shader.fragmentShader = shader.fragmentShader.replace(
-      '#include <emissivemap_fragment>',
-      `#include <emissivemap_fragment>
-       // Use vertex color brightness as emissive glow
-       float activation = max(vColor.r, max(vColor.g, vColor.b));
-       float emStr = smoothstep(0.3, 0.95, activation) * 0.5;
-       totalEmissiveRadiance += vColor.rgb * emStr;`
-    );
+    Object.assign(shader.uniforms, faceUniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>
+attribute float aFace;
+attribute vec3 aBary;
+flat varying float vFaceIndex;
+varying vec3 vBary;
+`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+vFaceIndex = aFace;
+vBary = aBary;
+`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+uniform sampler2D uFaceTex;
+uniform float uAtlasW;
+uniform float uAtlasH;
+uniform float uNumFaces;
+uniform float uFrame0;
+uniform float uFrame1;
+uniform float uAlpha;
+uniform sampler2D uAdjTex;
+uniform float uAdjW;
+uniform float uAdjH;
+flat varying float vFaceIndex;
+varying vec3 vBary;
+
+vec2 atlasUV(float face, float frame) {
+  float f = clamp(face, 0.0, uNumFaces - 1.0);
+  float idx = frame * uNumFaces + f;
+  float x = mod(idx, uAtlasW);
+  float y = floor(idx / uAtlasW);
+  return vec2((x + 0.5) / uAtlasW, (y + 0.5) / uAtlasH);
+}
+
+vec3 sampleFace(float face) {
+  if (face < 0.0) return vec3(0.0);
+  vec3 a = texture2D(uFaceTex, atlasUV(face, uFrame0)).rgb;
+  vec3 b = texture2D(uFaceTex, atlasUV(face, uFrame1)).rgb;
+  return mix(a, b, uAlpha);
+}
+`)
+      .replace('#include <map_fragment>', `
+diffuseColor.rgb = pow(diffuseColor.rgb, vec3(1.5)) * 0.55;
+vec3 myColor = sampleFace(vFaceIndex);
+
+// Look up 3 neighbor faces from adjacency texture
+float adjU = (vFaceIndex + 0.5) / uAdjW;
+float adjRow = floor(vFaceIndex / uAdjW);
+vec2 adjUV = vec2((mod(vFaceIndex, uAdjW) + 0.5) / uAdjW, (adjRow + 0.5) / uAdjH);
+vec4 neighbors = texture2D(uAdjTex, adjUV);
+
+// Blend near edges using barycentric coordinates
+// Edge 0 (v0-v1): opposite v2 → bary.z small near this edge → neighbor[0]
+// Edge 1 (v1-v2): opposite v0 → bary.x small near this edge → neighbor[1]
+// Edge 2 (v2-v0): opposite v1 → bary.y small near this edge → neighbor[2]
+float edgeBlend = 0.35;
+vec3 blended = myColor;
+
+float w0 = (1.0 - smoothstep(0.0, edgeBlend, vBary.z)) * step(0.0, neighbors.r);
+float w1 = (1.0 - smoothstep(0.0, edgeBlend, vBary.x)) * step(0.0, neighbors.g);
+float w2 = (1.0 - smoothstep(0.0, edgeBlend, vBary.y)) * step(0.0, neighbors.b);
+
+if (w0 + w1 + w2 > 0.001) {
+  vec3 n0 = sampleFace(neighbors.r);
+  vec3 n1 = sampleFace(neighbors.g);
+  vec3 n2 = sampleFace(neighbors.b);
+  vec3 nAvg = (n0 * w0 + n1 * w1 + n2 * w2) / (w0 + w1 + w2);
+  float wTotal = min(w0 + w1 + w2, 1.0);
+  blended = mix(myColor, nAvg, wTotal * 0.5);
+}
+
+float faceAct = max(blended.r, max(blended.g, blended.b));
+if (faceAct > 0.01) {
+  float a = min(1.0, faceAct * 2.0);
+  diffuseColor.rgb = mix(diffuseColor.rgb, blended, a);
+  totalEmissiveRadiance += blended * smoothstep(0.3, 0.95, faceAct) * 0.5;
+}
+`);
   };
+  mat.customProgramCacheKey = () => 'BrainFaceAtlas_v3';
+  mat.__faceUniforms = faceUniforms;
   return mat;
 }
-const brainMat = makeBrainMat();
 
-const meshL = new THREE.Mesh(geoL, brainMat);
-const meshR = new THREE.Mesh(geoR, makeBrainMat());
+function prepareGLBGeometry(gltf) {
+  let srcMesh = null;
+  gltf.scene.traverse((child) => { if (child.isMesh) srcMesh = child; });
+  let geo = srcMesh.geometry;
+  if (geo.index) geo = geo.toNonIndexed();
+  if (!geo.getAttribute('normal')) geo.computeVertexNormals();
+  const nVerts = geo.getAttribute('position').count;
+  const nFaces = Math.floor(nVerts / 3);
+  const faceAttr = new Float32Array(nVerts);
+  const baryAttr = new Float32Array(nVerts * 3);
+  for (let f = 0; f < nFaces; f++) {
+    const i = f * 3;
+    faceAttr[i] = f; faceAttr[i + 1] = f; faceAttr[i + 2] = f;
+    baryAttr[i * 3]     = 1; baryAttr[i * 3 + 1] = 0; baryAttr[i * 3 + 2] = 0;
+    baryAttr[i * 3 + 3] = 0; baryAttr[i * 3 + 4] = 1; baryAttr[i * 3 + 5] = 0;
+    baryAttr[i * 3 + 6] = 0; baryAttr[i * 3 + 7] = 0; baryAttr[i * 3 + 8] = 1;
+  }
+  geo.setAttribute('aFace', new THREE.BufferAttribute(faceAttr, 1));
+  geo.setAttribute('aBary', new THREE.BufferAttribute(baryAttr, 3));
+  if (!geo.getAttribute('color')) {
+    const colors = new Float32Array(nVerts * 3);
+    colors.fill(0.15);
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  }
+  return geo;
+}
 
-const hemiGroup = new THREE.Group();
-hemiGroup.add(meshL);
-hemiGroup.add(meshR);
-const brainGroup = new THREE.Group();
-brainGroup.add(hemiGroup);
-scene.add(brainGroup);
+function loadGLB(url) {
+  return new Promise((resolve, reject) => {
+    gltfLoader.load(url, resolve, undefined, reject);
+  });
+}
 
-/* ── Auto-fit camera to mesh bounds ── */
-const boxAll = new THREE.Box3().setFromObject(brainGroup);
-const size = new THREE.Vector3();
-boxAll.getSize(size);
-const center = new THREE.Vector3();
-boxAll.getCenter(center);
+Promise.all([
+  loadGLB('/models/left.glb'),
+  loadGLB('/models/right.glb'),
+  loadGLB('/models/head.glb'),
+]).then(([leftGltf, rightGltf, headGltf]) => {
+  const geoL = prepareGLBGeometry(leftGltf);
+  const geoR = prepareGLBGeometry(rightGltf);
 
-brainGroup.position.sub(center);
-// Rotate brain hemispheres from RAS to screen: face forward
-hemiGroup.rotation.x = -111 * Math.PI / 180;
-hemiGroup.rotation.z = Math.PI;
+  const matL = makeBrainMat(atlasL, adjTexL);
+  const matR = makeBrainMat(atlasR, adjTexR);
+  meshL = new THREE.Mesh(geoL, matL);
+  meshR = new THREE.Mesh(geoR, matR);
 
-const maxDim = Math.max(size.x, size.y, size.z);
-const fitDist = maxDim / (2 * Math.tan(Math.PI * camera.fov / 360));
-camera.position.set(0, 0, fitDist * 1.2);
-camera.near = fitDist * 0.01;
-camera.far = fitDist * 10;
-camera.updateProjectionMatrix();
-ctl.target.set(0, 0, 0);
-ctl.update();
+  hemiGroup = new THREE.Group();
+  hemiGroup.add(meshL);
+  hemiGroup.add(meshR);
+  brainGroup = new THREE.Group();
+  brainGroup.add(hemiGroup);
+  scene.add(brainGroup);
 
-/* ── Scale directional lights to match mesh size ── */
-d1.position.set(maxDim, maxDim * 2, maxDim * 1.5);
-d2.position.set(-maxDim, -maxDim, -maxDim);
-d3.position.set(0, -maxDim * 2, maxDim);
+  /* ── Auto-fit camera to mesh bounds ── */
+  const boxAll = new THREE.Box3().setFromObject(brainGroup);
+  const size = new THREE.Vector3();
+  boxAll.getSize(size);
+  const center = new THREE.Vector3();
+  boxAll.getCenter(center);
 
-/* ── Load transparent head overlay ── */
-const gltfLoader = new GLTFLoader();
-gltfLoader.load('/models/head.glb', (headGltf) => {
+  brainGroup.position.sub(center);
+  hemiGroup.rotation.x = -110 * Math.PI / 180;
+  hemiGroup.rotation.z = Math.PI;
+
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const fitDist = maxDim / (2 * Math.tan(Math.PI * camera.fov / 360));
+  camera.position.set(0, 0, fitDist * 1.2);
+  camera.near = fitDist * 0.01;
+  camera.far = fitDist * 10;
+  camera.updateProjectionMatrix();
+  ctl.target.set(0, 0, 0);
+  ctl.update();
+
+  d1.position.set(maxDim, maxDim * 2, maxDim * 1.5);
+  d2.position.set(-maxDim, -maxDim, -maxDim);
+  d3.position.set(0, -maxDim * 2, maxDim);
+
+  /* ── Head overlay ── */
   const headMesh = headGltf.scene;
   headMesh.traverse((child) => {
     if (!child.isMesh) return;
@@ -439,16 +657,18 @@ gltfLoader.load('/models/head.glb', (headGltf) => {
       side: THREE.DoubleSide, envMapIntensity: 0,
     });
   });
-  // The head GLB and brain GLB were made together by Meta.
-  // Use Meta's original transform for the head, then undo brain rotation.
-  headMesh.scale.setScalar(101);
-  headMesh.position.set(0, -69, 0);
+  headMesh.scale.setScalar(106);
+  headMesh.position.set(0, -69, -29);
   headMesh.rotation.set(0, 0, 0);
   brainGroup.add(headMesh);
   window._headMesh = headMesh;
+
+  setTimestep(0);
+  startAnimLoop();
 });
 
 window.applyAlign = () => {
+  if (!hemiGroup) return;
   const d = Math.PI / 180;
   hemiGroup.rotation.set(
     parseFloat(document.getElementById('bRX').value) * d,
@@ -463,6 +683,7 @@ window.applyAlign = () => {
   }
 };
 window.printAlign = () => {
+  if (!hemiGroup) return;
   const d = 180 / Math.PI;
   const b = hemiGroup.rotation;
   let msg = `Brain rot: ${(b.x*d).toFixed(1)}, ${(b.y*d).toFixed(1)}, ${(b.z*d).toFixed(1)}`;
@@ -473,72 +694,28 @@ window.printAlign = () => {
   alert(msg);
 };
 
-/* ── Color update: write vertex colors for both hemispheres ── */
-function updateColors(tLo, tHi, frac) {
-  const cL = geoL.getAttribute('color').array;
-  const cR = geoR.getAttribute('color').array;
-  const oLo = tLo * N_VERTS;
-  const oHi = tHi * N_VERTS;
-  const p99 = p99s[tLo] * (1 - frac) + p99s[tHi] * frac;
-  const vmin = p99 * 0.5;
-  const invRange = 1.0 / (p99 - vmin + 1e-8);
-  const ifrac = 1 - frac;
-
-  // Left hemisphere: vertices [0, HALF)
-  for (let i = 0; i < HALF; i++) {
-    const val = preds[oLo + i] * ifrac + preds[oHi + i] * frac;
-    const norm = (val - vmin) * invRange;
-    if (norm > 0.01) {
-      const n = norm > 1 ? 1 : norm;
-      const r = n * 2.5 > 1 ? 1 : n * 2.5;
-      const g = n > 0.4 ? ((n - 0.4) * 2.5 > 1 ? 1 : (n - 0.4) * 2.5) : 0;
-      const b = n > 0.7 ? ((n - 0.7) * 3.33 > 1 ? 1 : (n - 0.7) * 3.33) : 0;
-      const a = n * 2 > 1 ? 1 : n * 2;
-      const ia = 1 - a;
-      cL[i * 3]     = sulcBase[i * 3]     * ia + r * a;
-      cL[i * 3 + 1] = sulcBase[i * 3 + 1] * ia + g * a;
-      cL[i * 3 + 2] = sulcBase[i * 3 + 2] * ia + b * a;
-    } else {
-      cL[i * 3]     = sulcBase[i * 3];
-      cL[i * 3 + 1] = sulcBase[i * 3 + 1];
-      cL[i * 3 + 2] = sulcBase[i * 3 + 2];
-    }
+/* ── Frame update: set face atlas uniforms ── */
+function setFaceFrame(t, frac) {
+  if (!meshL || !meshR) return;
+  const tLo = Math.floor(t);
+  const tHi = Math.min(N_TIMESTEPS - 1, tLo + 1);
+  const alpha = frac !== undefined ? frac : 0;
+  for (const m of [meshL, meshR]) {
+    const u = m.material.__faceUniforms;
+    if (!u) continue;
+    u.uFrame0.value = tLo;
+    u.uFrame1.value = tHi;
+    u.uAlpha.value = alpha;
   }
-
-  // Right hemisphere: vertices [HALF, N_VERTS)
-  for (let i = 0; i < HALF; i++) {
-    const vi = HALF + i;  // index into global pred/sulcBase arrays
-    const val = preds[oLo + vi] * ifrac + preds[oHi + vi] * frac;
-    const norm = (val - vmin) * invRange;
-    if (norm > 0.01) {
-      const n = norm > 1 ? 1 : norm;
-      const r = n * 2.5 > 1 ? 1 : n * 2.5;
-      const g = n > 0.4 ? ((n - 0.4) * 2.5 > 1 ? 1 : (n - 0.4) * 2.5) : 0;
-      const b = n > 0.7 ? ((n - 0.7) * 3.33 > 1 ? 1 : (n - 0.7) * 3.33) : 0;
-      const a = n * 2 > 1 ? 1 : n * 2;
-      const ia = 1 - a;
-      cR[i * 3]     = sulcBase[vi * 3]     * ia + r * a;
-      cR[i * 3 + 1] = sulcBase[vi * 3 + 1] * ia + g * a;
-      cR[i * 3 + 2] = sulcBase[vi * 3 + 2] * ia + b * a;
-    } else {
-      cR[i * 3]     = sulcBase[vi * 3];
-      cR[i * 3 + 1] = sulcBase[vi * 3 + 1];
-      cR[i * 3 + 2] = sulcBase[vi * 3 + 2];
-    }
-  }
-
-  geoL.getAttribute('color').needsUpdate = true;
-  geoR.getAttribute('color').needsUpdate = true;
 }
 
-function setTimestep(t) { updateColors(t, t, 0); }
-function setTimestepInterp(tLo, tHi, frac) { updateColors(tLo, tHi, frac); }
+function setTimestep(t) { setFaceFrame(t, 0); }
+function setTimestepInterp(tLo, tHi, frac) { setFaceFrame(tLo, frac); }
 
 /* ── Open/Close animation state ── */
 let brainOpen = false;
 let openAmount = 0;
 let targetOpen = 0;
-const OPEN_DIST = 0.05;
 
 /* ── Segmented control logic ── */
 function initSegControl(id, onChange) {
@@ -569,6 +746,7 @@ const zoneNames = Object.keys(ZONES);
 const plotColors = [
   '#e63946', '#457b9d', '#2a9d8f', '#e9c46a',
   '#f4a261', '#264653', '#d62828', '#6a4c93',
+  '#00b4d8', '#ff6b6b', '#48bfe3', '#72efdd',
 ];
 const traces = zoneNames.map((name, i) => ({
   x: TIMES,
@@ -595,7 +773,7 @@ Plotly.newPlot('timeline', traces, {
   yaxis: { title: 'Mean |activation|', gridcolor: '#333', zerolinecolor: '#333' },
   legend: { orientation: 'h', y: 1.12, x: 0, font: { size: 10 } },
   shapes: [scrubLine],
-  hovermode: 'x unified',
+  hovermode: false,
 }, { responsive: true, displayModeBar: false });
 
 /* ── Slider + controls ── */
@@ -606,23 +784,31 @@ slider.max = N_TIMESTEPS - 1;
 
 let lastRenderedTime = 0;
 
+let plotUpdateTimer = 0;
 function goToTimestep(t) {
   slider.value = t;
   setTimestep(t);
   timeLabel.textContent = `t=${TIMES[t]}s`;
-  Plotly.relayout('timeline', { 'shapes[0].x0': TIMES[t], 'shapes[0].x1': TIMES[t] });
+  clearTimeout(plotUpdateTimer);
+  plotUpdateTimer = setTimeout(() => {
+    Plotly.relayout('timeline', { 'shapes[0].x0': TIMES[t], 'shapes[0].x1': TIMES[t] });
+  }, 80);
 }
 
 slider.addEventListener('input', () => {
   const t = parseInt(slider.value);
   goToTimestep(t);
   lastRenderedTime = TIMES[t];
+  const vid = document.getElementById('vidPlayer');
+  if (vid && vid.src) vid.currentTime = TIMES[t];
+  if (playing) {
+    playStartWall = performance.now();
+    playStartTime = TIMES[t];
+  }
 });
 
-/* ── Click on timeline to jump ── */
-document.getElementById('timeline').on('plotly_click', (data) => {
-  if (!data.points.length) return;
-  const clickTime = data.points[0].x;
+/* ── Click anywhere on timeline to jump ── */
+function seekToTime(clickTime) {
   let closest = 0, minDist = Infinity;
   for (let i = 0; i < TIMES.length; i++) {
     const d = Math.abs(TIMES[i] - clickTime);
@@ -630,13 +816,55 @@ document.getElementById('timeline').on('plotly_click', (data) => {
   }
   goToTimestep(closest);
   lastRenderedTime = TIMES[closest];
+  const vid = document.getElementById('vidPlayer');
+  if (vid && vid.src) vid.currentTime = TIMES[closest];
+  if (playing) {
+    playStartWall = performance.now();
+    playStartTime = TIMES[closest];
+  }
+}
+
+const tlEl = document.getElementById('timeline');
+function tlSeekFromEvent(e) {
+  if (!tlEl._fullLayout) return;
+  const xaxis = tlEl._fullLayout.xaxis;
+  const rect = tlEl.querySelector('.main-svg').getBoundingClientRect();
+  const clickTime = xaxis.p2d(e.clientX - rect.left - xaxis._offset);
+  if (isFinite(clickTime)) seekToTime(clickTime);
+}
+let tlDragging = false;
+tlEl.addEventListener('mousedown', (e) => {
+  const svg = tlEl.querySelector('.main-svg');
+  const plotArea = tlEl.querySelector('.draglayer');
+  if (!plotArea || !plotArea.contains(e.target)) return;
+  tlDragging = true;
+  tlSeekFromEvent(e);
 });
+window.addEventListener('mousemove', (e) => {
+  if (tlDragging) tlSeekFromEvent(e);
+});
+window.addEventListener('mouseup', () => { tlDragging = false; });
 
 /* ── Play/pause with smooth requestAnimationFrame playback ── */
 let playing = false;
 let playRAF = null;
 let playStartWall = 0;
 let playStartTime = 0;
+let lastPlotUpdate = 0;
+
+function updateTimeline(ct) {
+  const now = performance.now();
+  if (now - lastPlotUpdate > 100) {
+    lastPlotUpdate = now;
+    let closest = 0;
+    for (let i = 1; i < TIMES.length; i++) {
+      if (Math.abs(TIMES[i] - ct) < Math.abs(TIMES[closest] - ct)) closest = i;
+    }
+    slider.value = closest;
+    timeLabel.textContent = `t=${ct.toFixed(1)}s`;
+    Plotly.relayout('timeline', { 'shapes[0].x0': ct, 'shapes[0].x1': ct });
+  }
+}
 
 function playTick() {
   if (!playing) return;
@@ -645,14 +873,12 @@ function playTick() {
   const maxTime = TIMES[TIMES.length - 1];
 
   if (currentTime > maxTime) {
-    // Loop back to start
     playStartWall = performance.now();
     playStartTime = TIMES[0];
     playRAF = requestAnimationFrame(playTick);
     return;
   }
 
-  // Find surrounding timesteps for interpolation
   let lo = 0, hi = 1;
   for (let i = 0; i < TIMES.length - 1; i++) {
     if (TIMES[i] <= currentTime && TIMES[i + 1] >= currentTime) {
@@ -665,9 +891,7 @@ function playTick() {
 
   setTimestepInterp(lo, hi, frac);
   lastRenderedTime = currentTime;
-  slider.value = lo;
-  timeLabel.textContent = `t=${currentTime.toFixed(1)}s`;
-  Plotly.relayout('timeline', { 'shapes[0].x0': currentTime, 'shapes[0].x1': currentTime });
+  updateTimeline(currentTime);
 
   playRAF = requestAnimationFrame(playTick);
 }
@@ -683,16 +907,6 @@ playBtn.addEventListener('click', () => {
     playRAF = requestAnimationFrame(playTick);
   } else {
     if (playRAF) cancelAnimationFrame(playRAF);
-    // Snap to nearest discrete timestep on pause
-    let closest = 0, minD = Infinity;
-    for (let i = 0; i < TIMES.length; i++) {
-      const d = Math.abs(TIMES[i] - lastRenderedTime);
-      if (d < minD) { minD = d; closest = i; }
-    }
-    slider.value = closest;
-    setTimestep(closest);
-    timeLabel.textContent = `t=${TIMES[closest]}s`;
-    Plotly.relayout('timeline', { 'shapes[0].x0': TIMES[closest], 'shapes[0].x1': TIMES[closest] });
   }
 });
 
@@ -703,7 +917,12 @@ const vidPanel = document.getElementById('video-panel');
 if (HAS_VIDEO) {
   vidPanel.classList.add('visible');
   vidPlayer.src = 'data:video/mp4;base64,__VIDEO_B64__';
+  vidPlayer.volume = 0.5;
   vidPlayer.load();
+
+  document.getElementById('volSlider').addEventListener('input', (e) => {
+    vidPlayer.volume = parseFloat(e.target.value);
+  });
 
   function syncVideoToTimestep(t) {
     if (vidPlayer.readyState >= 2) {
@@ -727,44 +946,39 @@ if (HAS_VIDEO) {
     }
   });
 
-  // When video is playing, use it as the time source
+  // Sync video to follow playTick's time source (not the other way around)
   function videoSyncLoop() {
-    if (playing && !vidPlayer.paused) {
-      const ct = vidPlayer.currentTime;
-      let lo = 0, hi = 1;
-      for (let i = 0; i < TIMES.length - 1; i++) {
-        if (TIMES[i] <= ct && TIMES[i + 1] >= ct) { lo = i; hi = i + 1; break; }
-        if (i === TIMES.length - 2) { lo = i; hi = i + 1; }
-      }
-      const span = TIMES[hi] - TIMES[lo];
-      const frac = span > 0 ? (ct - TIMES[lo]) / span : 0;
-      setTimestepInterp(lo, hi, frac);
-      lastRenderedTime = ct;
-      slider.value = lo;
-      timeLabel.textContent = `t=${ct.toFixed(1)}s`;
-      Plotly.relayout('timeline', { 'shapes[0].x0': ct, 'shapes[0].x1': ct });
+    if (playing && vidPlayer.readyState >= 2) {
+      const drift = Math.abs(vidPlayer.currentTime - lastRenderedTime);
+      if (drift > 0.3) vidPlayer.currentTime = lastRenderedTime;
     }
     requestAnimationFrame(videoSyncLoop);
   }
   videoSyncLoop();
 }
 
-/* ── Initial render ── */
-setTimestep(0);
-
-/* ── Animation loop ── */
-(function animate() {
-  requestAnimationFrame(animate);
-
-  openAmount += (targetOpen - openAmount) * 0.08;
-  meshL.position.x = -openAmount * OPEN_DIST;
-  meshR.position.x = openAmount * OPEN_DIST;
-  meshL.rotation.y = -openAmount * 0.6;
-  meshR.rotation.y = openAmount * 0.6;
-
-  ctl.update();
-  renderer.render(scene, camera);
-})();
+/* ── Animation loop (started after GLBs load) ── */
+function startAnimLoop() {
+  (function animate() {
+    requestAnimationFrame(animate);
+    if (meshL && meshR) {
+      openAmount += (targetOpen - openAmount) * 0.06;
+      const spread = openAmount * 110;
+      meshL.position.x = -spread;
+      meshR.position.x = spread;
+      meshL.rotation.z = openAmount * Math.PI / 2;
+      meshR.rotation.z = -openAmount * Math.PI / 2;
+      if (window._headMesh) {
+        window._headMesh.visible = openAmount < 0.99;
+        window._headMesh.traverse((child) => {
+          if (child.isMesh) child.material.opacity = 0.06 * (1 - openAmount);
+        });
+      }
+    }
+    ctl.update();
+    renderer.render(scene, camera);
+  })();
+}
 
 /* ── Resize handler ── */
 window.addEventListener('resize', () => {

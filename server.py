@@ -24,6 +24,7 @@ import torch
 from flask import Flask, render_template_string, request, jsonify, send_file, redirect, url_for
 
 from tribev2.demo_utils import TribeModel, get_audio_and_text_events, build_text_events_from_text
+from tribev2.fast import FastTribePipeline
 from tribev2.viewer import build_viewer_html
 from tribev2.utils import get_hcp_labels
 
@@ -35,6 +36,7 @@ if not log.handlers:
     log.addHandler(_h)
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB
 CACHE = Path("./cache")
 CACHE.mkdir(exist_ok=True)
 UPLOAD_DIR = CACHE / "uploads"
@@ -51,22 +53,78 @@ ZONE_GROUPS = {
     "Default mode": ["POS1", "POS2", "RSC", "v23ab", "d23ab", "31a", "31pd", "31pv", "7m", "PCV", "DVT"],
 }
 
+# Custom spherical ROIs defined by MNI coordinates + radius (mm).
+# Each entry: name -> list of (x, y, z) MNI coords. All coords for a name
+# are merged into one ROI. Radius is set globally below.
+CUSTOM_ROIS = {
+    "Insula": [(40, 16, -4), (-38, 10, 4)],
+    "vmPFC/OFC": [(2, 42, -16)],
+    "R DLPFC": [(42, 24, 28), (38, 30, 36)],
+}
+CUSTOM_ROI_RADIUS = 10  # mm
+
 # ── Model ──────────────────────────────────────────────────────────────
 
-_model = None
+_pipeline = None
 
-def get_model():
-    global _model
-    if _model is None:
-        _model = TribeModel.from_pretrained(
+def get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = FastTribePipeline.from_pretrained(
             "facebook/tribev2",
-            cache_folder=CACHE,
-            config_update={
-                "data.text_feature.model_name": "unsloth/Llama-3.2-3B",
-                "data.num_workers": 0,
-            },
+            cache_dir=str(CACHE),
+            text_model="unsloth/Llama-3.2-3B",
         )
-    return _model
+    return _pipeline
+
+def _build_custom_roi_indices():
+    """Project MNI-coordinate spherical ROIs onto fsaverage5 surface."""
+    import nibabel as nib
+    from nilearn import datasets, surface
+
+    if not CUSTOM_ROIS:
+        return {}
+
+    fs = datasets.fetch_surf_fsaverage("fsaverage5")
+    radius = CUSTOM_ROI_RADIUS
+    n_verts_hemi = 10242
+
+    roi_indices = {}
+    for name, coords_list in CUSTOM_ROIS.items():
+        all_verts = []
+        for mni_xyz in coords_list:
+            # Build a 2mm resolution volume with a sphere at the MNI coordinate
+            affine = np.eye(4)
+            affine[0, 3] = -90; affine[1, 3] = -126; affine[2, 3] = -72
+            affine[0, 0] = affine[1, 1] = affine[2, 2] = 2  # 2mm voxels
+            shape = (91, 109, 91)
+            vol = np.zeros(shape, dtype=np.float32)
+            # MNI coord -> voxel index
+            vx = int(round((mni_xyz[0] - affine[0, 3]) / affine[0, 0]))
+            vy = int(round((mni_xyz[1] - affine[1, 3]) / affine[1, 1]))
+            vz = int(round((mni_xyz[2] - affine[2, 3]) / affine[2, 2]))
+            # Fill sphere
+            r_vox = int(np.ceil(radius / 2))
+            for dx in range(-r_vox, r_vox + 1):
+                for dy in range(-r_vox, r_vox + 1):
+                    for dz in range(-r_vox, r_vox + 1):
+                        ix, iy, iz = vx + dx, vy + dy, vz + dz
+                        if 0 <= ix < shape[0] and 0 <= iy < shape[1] and 0 <= iz < shape[2]:
+                            dist_mm = np.sqrt((dx * 2) ** 2 + (dy * 2) ** 2 + (dz * 2) ** 2)
+                            if dist_mm <= radius:
+                                vol[ix, iy, iz] = 1.0
+            img = nib.Nifti1Image(vol, affine)
+            # Project onto both hemispheres
+            for hemi, offset in [("left", 0), ("right", n_verts_hemi)]:
+                proj = surface.vol_to_surf(img, fs[f"pial_{hemi}"])
+                verts = np.where(proj > 0.1)[0] + offset
+                if len(verts) > 0:
+                    all_verts.append(verts)
+        if all_verts:
+            roi_indices[name] = np.unique(np.concatenate(all_verts))
+            log.info(f"Custom ROI '{name}': {len(roi_indices[name])} vertices")
+    return roi_indices
+
 
 def get_roi_indices():
     labels = get_hcp_labels(mesh="fsaverage5", combine=False, hemi="both")
@@ -79,6 +137,8 @@ def get_roi_indices():
                     verts.append(indices)
         if verts:
             zone_indices[zone_name] = np.concatenate(verts)
+    # Merge custom MNI-based ROIs
+    zone_indices.update(_build_custom_roi_indices())
     return zone_indices
 
 def build_zone_timeseries(preds, time_axis):
@@ -343,21 +403,31 @@ def api_predict():
             df = build_text_events_from_text(text)
             input_kind = "text"
 
-        _current_status = {"message": "Running inference..."}
-        model = get_model()
-        preds, segments = model.predict(events=df, verbose=True)
+        _current_status = {"message": "Loading pipeline..."}
+        pipeline = get_pipeline()
+
+        def _update_status(msg):
+            global _current_status
+            _current_status = {"message": msg}
+
+        preds, segments = pipeline.predict(events=df, verbose=True, status_callback=_update_status)
 
         n = preds.shape[0]
+        HRF_DELAY = 5.0  # model trained with 5s hemodynamic offset
         if segments:
             try:
                 video_duration = max(e.start + e.duration for seg in segments for e in seg.ns_events if hasattr(e, 'type') and e.type == 'Video')
-                time_axis = [i * video_duration / n for i in range(n)]
+                time_axis = [i * video_duration / n - HRF_DELAY for i in range(n)]
             except ValueError:
-                time_axis = [s.start for s in segments]
+                time_axis = [s.start - HRF_DELAY for s in segments]
         else:
-            time_axis = list(range(n))
+            time_axis = [i - HRF_DELAY for i in range(n)]
+        # Clamp negative times to 0
+        time_axis = [max(0, t) for t in time_axis]
 
+        _current_status = {"message": "Computing zone timeseries..."}
         zone_df = build_zone_timeseries(preds, time_axis)
+        _current_status = {"message": "Saving results..."}
         source_name = Path(video_path or audio_path or "text").name
         run_id = save_run(preds, time_axis, zone_df, input_kind, source_name, video_path=video_path)
 
